@@ -8,6 +8,10 @@ import { undo } from '../src/index.js'
 // touchmove and only records the semantic move with command(). ignoreNode tells
 // the automatic recorder that those nodes' insertions and removals are not
 // edits, so the gesture leaves no generic Edit entry beside the command's one.
+//
+// The idle window is far longer than any test and each batch is closed with
+// flush(), so a loaded machine can neither split a gesture across two windows
+// nor leave a window open past the assertion.
 
 const BOARD = '<!DOCTYPE html><html><head><title>Board</title></head><body>' +
   '<ul id="list">' +
@@ -20,7 +24,7 @@ const BOARD = '<!DOCTYPE html><html><head><title>Board</title></head><body>' +
 function board(opts = {}) {
   const dom = makeDom(BOARD)
   const doc = dom.window.document
-  const scope = createScope({ scope: doc.body, idleWindowMs: 20, ...opts })
+  const scope = createScope({ scope: doc.body, idleWindowMs: 60_000, ...opts })
   scope.start()
   return { dom, doc, scope }
 }
@@ -46,7 +50,7 @@ async function gesture(doc, indices) {
 test('a gesture over an ignored node leaves only its command entry', async () => {
   const { doc, scope } = board({ ignoreNode: draggedCard })
   await gesture(doc, [2, 0, 1])
-  await tick(40)
+  scope.flush()
   assert.deepEqual(labels(scope), [], "the gesture's own moves are not edits")
 
   const receipt = scope.command('Move card', () => { move(doc, 'card-1', 0) })
@@ -67,7 +71,7 @@ test('a record that moves an ignored node and also inserts another node is kept'
   replacement.textContent = 'Delta'
 
   list.replaceChild(replacement, card(doc, 'card-1'))
-  await tick(40)
+  scope.flush()
 
   assert.deepEqual(labels(scope), ['Edit'], 'the record also touches a node the caller does not ignore')
   assert.ok(card(doc, 'card-4'))
@@ -83,7 +87,7 @@ test('an unrelated edit during the same window keeps its own entry', async () =>
   other.textContent = 'Beta edited'
   await tick(5)
   move(doc, 'card-1', 0)
-  await tick(40)
+  scope.flush()
 
   assert.deepEqual(labels(scope), ['Edit'])
   assert.deepEqual(positions(doc), ['card-1', 'card-2', 'card-3'])
@@ -98,7 +102,7 @@ test('an unrelated edit during the same window keeps its own entry', async () =>
 test('without ignoreNode the same gesture is recorded as before', async () => {
   const { doc, scope } = board()
   await gesture(doc, [2, 0, 1])
-  await tick(40)
+  scope.flush()
   assert.deepEqual(labels(scope), ['Edit'], 'nothing is ignored, so the moves are ordinary edits')
   scope.stop()
 })
@@ -106,10 +110,10 @@ test('without ignoreNode the same gesture is recorded as before', async () => {
 test('start() and create() forward the ignoreNode option', async () => {
   const startDom = makeDom(BOARD)
   const startDoc = startDom.window.document
-  undo.start({ scope: startDoc.body, idleWindowMs: 20, bindKeys: false, ignoreNode: draggedCard })
+  undo.start({ scope: startDoc.body, idleWindowMs: 60_000, bindKeys: false, ignoreNode: draggedCard })
   try {
     await gesture(startDoc, [2, 0])
-    await tick(40)
+    undo.flush()
     assert.deepEqual(undo.history, [], 'the singleton honors ignoreNode')
   } finally {
     undo.stop()
@@ -117,11 +121,11 @@ test('start() and create() forward the ignoreNode option', async () => {
 
   const createDom = makeDom(BOARD)
   const createDoc = createDom.window.document
-  const scope = undo.create({ scope: createDoc.body, idleWindowMs: 20, ignoreNode: draggedCard })
+  const scope = undo.create({ scope: createDoc.body, idleWindowMs: 60_000, ignoreNode: draggedCard })
   scope.start()
   try {
     await gesture(createDoc, [2, 0])
-    await tick(40)
+    scope.flush()
     assert.deepEqual(scope.history, [], 'create() honors ignoreNode')
   } finally {
     scope.stop()
