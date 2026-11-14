@@ -53,9 +53,18 @@ function childIdentities(parent, isIgnored) {
 // `host` is the element a removed subtree belongs under. A detached node has no
 // ancestors left, so a predicate that reads them (is this attribute painted by an
 // app above it?) receives the host and answers as it did while attached.
-export function durableProjection(node, ignoredAttribute, host = null, ignoredNode = null) {
+function ownForm(node, form, host) {
+  if (typeof form !== 'function' || !isNode(node) || node.nodeType !== 1) return null
+  let own = null
+  try { own = form(node, host) } catch (_) { own = null }
+  return typeof own === 'string' ? `#form:${JSON.stringify(own)}` : null
+}
+
+export function durableProjection(node, ignoredAttribute, host = null, ignoredNode = null, form = null, texts = null) {
   if (!isNode(node)) return null
-  if (node.nodeType === 3) return `#text:${JSON.stringify(node.data)}`
+  const own = ownForm(node, form, host)
+  if (own != null) return own
+  if (node.nodeType === 3) return `#text:${JSON.stringify(texts && texts.has(node) ? texts.get(node) : node.data)}`
   if (node.nodeType === 8) return `#comment:${JSON.stringify(node.data)}`
   if (node.nodeType !== 1) return `#node:${node.nodeType}`
   const attributes = []
@@ -69,8 +78,10 @@ export function durableProjection(node, ignoredAttribute, host = null, ignoredNo
   const children = []
   if (node.childNodes) {
     for (const child of node.childNodes) {
+      const ownChild = ownForm(child, form, host)
+      if (ownChild != null) { children.push(ownChild); continue }
       if (isIgnoredNode(child, ignoredNode)) continue
-      children.push(durableProjection(child, ignoredAttribute, host, ignoredNode))
+      children.push(durableProjection(child, ignoredAttribute, host, ignoredNode, form, texts))
     }
   }
   const tag = String(node.tagName || '').toLowerCase()
@@ -153,7 +164,8 @@ function slotIndex(list, primitive) {
 export function compileCertificate(primitives, env = {}) {
   const isIgnored = env.isIgnored || null
   const ignoredAttribute = env.ignoreAttribute || null
-  const normalized = normalizePrimitives(primitives)
+  const durableForm = env.durableForm || null
+  const normalized = normalizePrimitives(primitives, { sameContent })
 
   const structural = []
   for (const p of normalized) {
@@ -183,7 +195,7 @@ export function compileCertificate(primitives, env = {}) {
       if (move.at === item) steps.push(move.step)
       continue
     }
-    steps.push(structuralStep(item, states.get(item), ignoredAttribute, isIgnored))
+    steps.push(structuralStep(item, states.get(item), ignoredAttribute, isIgnored, durableForm))
   }
   return { replayable: true, reason: null, steps }
 }
@@ -276,7 +288,7 @@ function pairMoves(structural, states) {
   return moves
 }
 
-function structuralStep(item, state, ignoredAttribute, ignoredNode) {
+function structuralStep(item, state, ignoredAttribute, ignoredNode, durableForm = null) {
   const kind = item.primitive.kind
   return {
     type: kind === 'add' ? 'add' : 'restore',
@@ -285,7 +297,7 @@ function structuralStep(item, state, ignoredAttribute, ignoredNode) {
     seqBefore: state.before,
     seqAfter: state.after,
     slot: item.primitive,
-    content: item.nodes.map((node) => durableProjection(node, ignoredAttribute, item.parent, ignoredNode)),
+    content: item.nodes.map((node) => durableProjection(node, ignoredAttribute, item.parent, ignoredNode, durableForm)),
     ids: kind === 'remove' ? item.nodes.flatMap((node) => durableIdsIn(node)) : [],
     targets: targetsOf(item.nodes, kind === 'add' ? 'added' : 'removed', item.parent),
   }
@@ -305,11 +317,13 @@ export function preflight(certificate, direction, env = {}) {
   const context = {
     isIgnored: env.isIgnored || null,
     ignoreAttribute: env.ignoreAttribute || null,
+    durableForm: env.durableForm || null,
     isProtected: env.isProtected || null,
     inScope: env.inScope || (() => true),
     liveNodesWithIds: env.liveNodesWithIds || (() => []),
     sim: new Map(),
     planned: new Map(),
+    texts: new Map(),
     operations: [],
   }
 
@@ -344,6 +358,12 @@ function refuseStep(code, targets) {
   return { code, targets: targets || [] }
 }
 
+export function sameContent(a, b) {
+  if (a === b) return true
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  return a.replace(/\u00A0|&nbsp;/g, ' ') === b.replace(/\u00A0|&nbsp;/g, ' ')
+}
+
 function liveValue(primitive) {
   if (primitive.kind === 'text') return primitive.target.data
   if (primitive.kind === 'value') {
@@ -369,11 +389,13 @@ function checkScalar(step, undoing, context) {
   if (primitive.kind === 'value' && typeof primitive.write === 'function' && typeof primitive.read !== 'function') {
     return refuseStep('unsupported', step.targets)
   }
-  if (liveValue(primitive) !== expected) return refuseStep('content-changed', step.targets)
+  const live = liveValue(primitive)
+  if (primitive.content === true ? !sameContent(live, expected) : live !== expected) return refuseStep('content-changed', step.targets)
   if (primitive.kind === 'value') {
-    context.operations.push({ type: 'value', target: primitive.target, prop: primitive.prop || 'value', value: next, read: primitive.read || null, write: primitive.write || null })
+    context.operations.push({ type: 'value', target: primitive.target, prop: primitive.prop || 'value', value: next, read: primitive.read || null, write: primitive.write || null, content: primitive.content === true })
   } else if (primitive.kind === 'text') {
     context.operations.push({ type: 'text', target: primitive.target, data: next })
+    context.texts.set(primitive.target, next)
   } else {
     context.operations.push({ type: 'attr', target: primitive.target, name: primitive.name, value: next == null ? null : next })
   }
@@ -387,7 +409,7 @@ function checkAdd(step, undoing, context) {
     const protectedTargets = protectedWithin(step.nodes, context.isProtected)
     if (protectedTargets.length > 0) return refuseStep('protected', protectedTargets)
     for (let i = 0; i < step.nodes.length; i++) {
-      if (durableProjection(step.nodes[i], context.ignoreAttribute, step.parent, context.isIgnored) !== step.content[i]) return refuseStep('content-changed', step.targets)
+      if (durableProjection(step.nodes[i], context.ignoreAttribute, step.parent, context.isIgnored, context.durableForm) !== step.content[i]) return refuseStep('content-changed', step.targets)
     }
     for (const node of step.nodes) {
       context.operations.push({ type: 'remove', node })
@@ -422,7 +444,7 @@ function checkRestore(step, undoing, context) {
     if (!sameSequence(listFor(context, step.parent), step.seqAfter)) return refuseStep('structure-changed', step.targets)
     for (let i = 0; i < step.nodes.length; i++) {
       const node = step.nodes[i]
-      if (node.parentNode || durableProjection(node, context.ignoreAttribute, step.parent, context.isIgnored) !== step.content[i]) return refuseStep('content-changed', step.targets)
+      if (node.parentNode || durableProjection(node, context.ignoreAttribute, step.parent, context.isIgnored, context.durableForm) !== step.content[i]) return refuseStep('content-changed', step.targets)
     }
     if (step.ids.length > 0 && liveDuplicates(step.ids, context)) return refuseStep('duplicate-id', step.targets)
     const at = slotIndex(step.seqAfter, step.slot)
@@ -445,9 +467,11 @@ function checkRestore(step, undoing, context) {
   // column before its column is removed) is leaving, so the removed subtree is
   // compared without it, as it was when it was recorded.
   const leaving = (node) => context.planned.get(node) === true || (typeof context.isIgnored === 'function' && context.isIgnored(node))
+  // Text an earlier step of this replay rewrites (a field emptied before its text node
+  // is taken out) is compared as that step leaves it, as it was when it was recorded.
   for (let i = 0; i < step.nodes.length; i++) {
     const node = step.nodes[i]
-    if (node.parentNode !== step.parent || durableProjection(node, context.ignoreAttribute, step.parent, leaving) !== step.content[i]) return refuseStep('content-changed', step.targets)
+    if (node.parentNode !== step.parent || durableProjection(node, context.ignoreAttribute, step.parent, leaving, context.durableForm, context.texts) !== step.content[i]) return refuseStep('content-changed', step.targets)
   }
   for (const node of step.nodes) {
     context.operations.push({ type: 'remove', node })
@@ -505,6 +529,15 @@ function findChildByIdentity(parent, id) {
   return null
 }
 
+function changedEnd(before, after) {
+  const max = Math.min(before.length, after.length)
+  let prefix = 0
+  while (prefix < max && before[prefix] === after[prefix]) prefix++
+  let suffix = 0
+  while (suffix < max - prefix && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix++
+  return after.length - suffix
+}
+
 function writeValue(op, value) {
   if (typeof op.write === 'function') op.write(op.target, value)
   else op.target[op.prop] = value
@@ -513,8 +546,9 @@ function writeValue(op, value) {
 export function applyOperations(operations) {
   const journal = []
   try {
-    for (const op of operations) applyOne(op, journal)
-    return { ok: true }
+    let caret = null
+    for (const op of operations) caret = applyOne(op, journal) || caret
+    return { ok: true, caret }
   } catch (error) {
     for (let i = journal.length - 1; i >= 0; i--) {
       try { journal[i]() } catch (_) { /* the rollback keeps trying the rest */ }
@@ -538,13 +572,16 @@ function applyOne(op, journal) {
     const previous = op.target.data
     op.target.data = op.data
     journal.push(() => { op.target.data = previous })
-    return
+    return { node: op.target, offset: changedEnd(previous, op.data) }
   }
   if (op.type === 'value') {
     const previous = typeof op.read === 'function' ? op.read(op.target) : op.target[op.prop]
+    const textBefore = op.content ? op.target.textContent : null
     writeValue(op, op.value)
     journal.push(() => writeValue(op, previous))
-    return
+    if (!op.content) return
+    const textAfter = op.target.textContent
+    return textAfter === textBefore ? undefined : { root: op.target, textOffset: changedEnd(textBefore, textAfter) }
   }
   if (op.type === 'insert') {
     const before = op.beforeId == null ? null : findChildByIdentity(op.parent, op.beforeId)
@@ -556,13 +593,17 @@ function applyOne(op, journal) {
       if (fromParent) fromParent.insertBefore(op.node, fromNext && fromNext.parentNode === fromParent ? fromNext : null)
       else if (op.node.parentNode === op.parent) op.parent.removeChild(op.node)
     })
-    return
+    if (op.node.nodeType !== 3) return
+    return { node: op.node, offset: op.node.data.length }
   }
   if (op.type === 'remove') {
     const parent = op.node.parentNode
     if (!parent) throw new Error('hyper-undo: replay target is no longer attached')
     const next = op.node.nextSibling
+    const index = Array.prototype.indexOf.call(parent.childNodes, op.node)
     parent.removeChild(op.node)
     journal.push(() => parent.insertBefore(op.node, next))
+    if (op.node.nodeType !== 3) return
+    return { node: parent, offset: index }
   }
 }

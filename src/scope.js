@@ -1,7 +1,8 @@
 import { recordsToPrimitives } from './primitives.js'
-import { compileCertificate, preflight, applyOperations, described } from './replay-plan.js'
+import { compileCertificate, preflight, applyOperations, described, sameContent } from './replay-plan.js'
 import { shouldIgnore } from './filter.js'
 import { createEmitter } from './emitter.js'
+import { watchTyping } from './typing.js'
 
 const DEFAULTS = {
   maxHistory: 100,
@@ -11,6 +12,9 @@ const DEFAULTS = {
   ignoreAttribute: null,
   isProtected: null,
   ignoreNode: null,
+  durableForm: null,
+  typingBreak: null,
+  refused: null,
   debug: false,
 }
 
@@ -32,6 +36,10 @@ export function createScope(opts) {
   let recordingMode = config.recording === 'commands' ? 'commands' : 'automatic'
   let capture = null       // { records, primitives } while an explicit command runs
   let replaying = false    // true only inside an undo/redo preflight and apply
+  let tracked = new WeakMap()   // root element -> { prop, read, write, baseline }
+  let composing = false        // an input method composition is open
+  let movedUnderStep = false   // a paused writer changed what the open step changed
+  let typingCleanup = null     // watchTyping's cleanup, kept for stop()
 
   function log(...args) { if (config.debug) console.log('[hyper-undo]', ...args) }
 
@@ -48,6 +56,15 @@ export function createScope(opts) {
       subtree: true,
       attributeOldValue: true,
       characterDataOldValue: true,
+    })
+    typingCleanup = watchTyping(config.scope, {
+      sentence: config.typingBreak === 'sentence',
+      stepOpen: () => {
+        if (pauseDepth === 0 && observer) handleRecords(observer.takeRecords())
+        return pendingPrimitives.length > 0
+      },
+      endStep: flush,
+      composing: setComposing,
     })
     log('started')
   }
@@ -74,6 +91,8 @@ export function createScope(opts) {
     if (!started) return
     started = false
     if (observer) { observer.disconnect(); observer = null }
+    if (typingCleanup) { typingCleanup(); typingCleanup = null }
+    composing = false
     clearIdleTimer()
     undoStack.length = 0
     redoStack.length = 0
@@ -82,6 +101,7 @@ export function createScope(opts) {
     capture = null
     replaying = false
     pauseDepth = 0   // reset so a reused (created) scope doesn't restart paused
+    tracked = new WeakMap()
     log('stopped')
   }
 
@@ -91,6 +111,70 @@ export function createScope(opts) {
   function scopeDisconnected() {
     const el = config.scope
     return !!(el && el.nodeType === 1 && el.isConnected === false)
+  }
+
+  // --- Tracked content ---
+
+  function readContent(root, read) {
+    try { const value = read(root); return typeof value === 'string' ? value : null } catch (_) { return null }
+  }
+
+  function trackContent(root, { read, write, prop = 'content' } = {}) {
+    if (!root || typeof read !== 'function' || typeof write !== 'function') return () => {}
+    const state = { prop, read, write, baseline: readContent(root, read) }
+    tracked.set(root, state)
+    return () => { if (tracked.get(root) === state) tracked.delete(root) }
+  }
+
+  function trackedRootOf(node) {
+    for (let n = node; n; n = n.parentNode) if (tracked.has(n)) return n
+    return null
+  }
+
+  function isTrackedContent(record) {
+    const root = trackedRootOf(record.target)
+    return !!root && !(record.type === 'attributes' && record.target === root)
+  }
+
+  function contentRootsIn(records) {
+    const roots = new Set()
+    for (const record of records) if (isTrackedContent(record)) roots.add(trackedRootOf(record.target))
+    return roots
+  }
+
+  function sampleContent(roots) {
+    const out = []
+    for (const root of roots) {
+      const state = tracked.get(root)
+      const now = readContent(root, state.read)
+      if (now == null) continue
+      if (sameContent(now, state.baseline)) { state.baseline = now; continue }
+      if (state.baseline != null) out.push({ kind: 'value', target: root, prop: state.prop, oldValue: state.baseline, newValue: now, read: state.read, write: state.write, content: true })
+      state.baseline = now
+    }
+    return out
+  }
+
+  function rebaseContent(roots) {
+    for (const root of roots) {
+      const state = tracked.get(root)
+      state.baseline = readContent(root, state.read)
+    }
+  }
+
+  // Records another writer made while this scope was paused are dropped. When one of
+  // them changed a text node, an attribute or a tracked field the open step has already
+  // changed, the step has to close before this tab types again: joined with that typing
+  // it would run from before the other writer's change to after it, and its undo would
+  // take their change back.
+  function dropPaused(records) {
+    const roots = contentRootsIn(records)
+    if (!movedUnderStep && pendingPrimitives.some((p) => p.kind === 'value'
+      ? roots.has(p.target)
+      : records.some((r) => r.target === p.target && (r.type === 'characterData' ? p.kind === 'text' : r.type === 'attributes' && r.attributeName === p.name)))) {
+      movedUnderStep = true
+    }
+    rebaseContent(roots)
   }
 
   // --- Observer callback ---
@@ -115,9 +199,10 @@ export function createScope(opts) {
     // Commands mode: an unbracketed record is some other writer's (a merge, a
     // sap paint, a sortable gesture). It changes the document, so later guards
     // see it, but it is not a local action and earns no entry.
-    if (recordingMode === 'commands') return
-    if (pauseDepth > 0) return
+    if (recordingMode === 'commands') { rebaseContent(contentRootsIn(records)); return }
+    if (pauseDepth > 0) { dropPaused(records); return }
     const prims = convertRecords(dropIgnoredRecords(records), bracketed)
+    for (const p of sampleContent(contentRootsIn(records))) prims.push(p)
     if (prims.length > 0) {
       for (const p of prims) pendingPrimitives.push(p)
       restartIdleTimer()
@@ -155,15 +240,27 @@ export function createScope(opts) {
   // fields too; head's <title> stays with the bracket's own title capture.
   function convertRecords(records, bracketed = false) {
     const removedHere = removedFromScope(records)
-    const kept = records.filter((r) => (observedHere(r.target) || removedHere(r.target) || (bracketed && inHead(r.target))) && !shouldIgnore(r.target, config.ignoreAttribute, r))
+    const kept = records.filter((r) => (observedHere(r.target) || removedHere(r.target) || (bracketed && inHead(r.target))) && !isTrackedContent(r) && !shouldIgnore(r.target, config.ignoreAttribute, r))
     return recordsToPrimitives(kept, (node) => shouldIgnore(node, config.ignoreAttribute))
   }
 
   // --- Idle batching ---
 
+  function setComposing(on) {
+    composing = !!on
+    if (!composing && pendingPrimitives.length > 0) restartIdleTimer()
+  }
+
   function restartIdleTimer() {
     clearIdleTimer()
-    idleTimer = setTimeout(closeIdleBatch, config.idleWindowMs)
+    idleTimer = setTimeout(onIdle, config.idleWindowMs)
+  }
+  // A step never closes while a composition is open: the timer waits it out and
+  // the composed text lands in one entry.
+  function onIdle() {
+    idleTimer = null
+    if (composing) { idleTimer = setTimeout(onIdle, config.idleWindowMs); return }
+    closeIdleBatch()
   }
   function clearIdleTimer() {
     if (idleTimer != null) { clearTimeout(idleTimer); idleTimer = null }
@@ -179,7 +276,7 @@ export function createScope(opts) {
   // --- Commit machinery ---
 
   function pushCommit(label, primitives) {
-    const certificate = compileCertificate(primitives, { isIgnored: isIgnoredNode, ignoreAttribute: isIgnoredAttribute })
+    const certificate = compileCertificate(primitives, { isIgnored: isIgnoredNode, ignoreAttribute: isIgnoredAttribute, durableForm: config.durableForm })
     if (certificate.steps.length === 0) {
       log('commit', label, 'with nothing to record')
       emitter.emit('commit')
@@ -254,20 +351,22 @@ export function createScope(opts) {
     // If an OUTER pause is still active (this capture frame is nested inside an
     // exclusion pause), honor the outer "exclude everything" contract: discard
     // the captured records instead of committing through the outer pause.
-    if (pauseDepth > 1) { observer.takeRecords(); return }
+    if (pauseDepth > 1) { rebaseContent(contentRootsIn(observer.takeRecords())); return }
     // Close any pending idle batch (e.g. in-progress typing captured BEFORE the
     // pause) as its own commit FIRST, so the structural commit we're about to
     // push lands AFTER it in history. Without this, type-then-immediately-add
     // would record the structural op before the typing, inverting undo order.
     flush()
-    const primitives = convertRecords(observer.takeRecords(), true)
+    const records = observer.takeRecords()
+    const primitives = convertRecords(records, true)
+    for (const p of sampleContent(contentRootsIn(records))) primitives.push(p)
     if (primitives.length === 0) return
     clearIdleTimer()
     pushCommit(label, primitives)
   }
 
   function discardCaptured() {
-    if (observer) observer.takeRecords()
+    if (observer) rebaseContent(contentRootsIn(observer.takeRecords()))
   }
 
   // --- Explicit commands ---
@@ -333,6 +432,7 @@ export function createScope(opts) {
     capture = null
     if (!held) return []
     const primitives = convertRecords(held.records, true)
+    for (const p of sampleContent(contentRootsIn(held.records))) primitives.push(p)
     for (const p of held.primitives) primitives.push(p)
     return primitives
   }
@@ -465,7 +565,14 @@ export function createScope(opts) {
     if (pauseDepth === 0) return  // underflow guard
     pauseDepth--
     // Discard records captured during the pause only on the outermost release.
-    if (pauseDepth === 0 && observer) observer.takeRecords()
+    if (pauseDepth === 0 && observer) {
+      dropPaused(observer.takeRecords())
+      if (movedUnderStep) {
+        movedUnderStep = false
+        clearIdleTimer()
+        closeIdleBatch()
+      }
+    }
     log('resumed', pauseDepth)
   }
 
@@ -474,51 +581,88 @@ export function createScope(opts) {
   // One entry is applied whole or not at all. Preflight compares the certificate
   // against the live document without writing; only a fully validated plan
   // reaches the DOM, and a native failure rolls it back and keeps both stacks.
+  // With `refused: 'skip'` a refused entry is dropped and the call goes on to the
+  // next one, so a step that can no longer be replayed never blocks older ones.
   function replay(direction, requestedId) {
     if (scopeDisconnected()) { stop(); return { ok: false, code: 'disconnected' } }
+    // A consumer can hold replay (an open gesture, a pending save) without
+    // refusing the entry: the stacks and the document stay as they are.
+    if (typeof config.holdReplay === 'function' && config.holdReplay()) return { ok: false, code: 'held' }
     flush()
     const source = direction === 'undo' ? undoStack : redoStack
     const destination = direction === 'undo' ? redoStack : undoStack
-    const entry = source.at(-1)
+    const skipped = []
+    let entry = source.at(-1)
     if (!entry) return { ok: false, code: 'empty' }
     if (requestedId && requestedId !== entry.id) {
       const requested = findEntry(requestedId) || entry
       return refuse(requested, direction, 'stale-entry')
     }
-    let checked
-    replaying = true
-    try {
-      checked = preflight(entry.certificate, direction, {
-        isIgnored: isIgnoredNode,
-        ignoreAttribute: isIgnoredAttribute,
-        isProtected: isProtectedNode,
-        inScope,
-        liveNodesWithIds,
-      })
-    } finally {
-      replaying = false
+    const canSkip = config.refused === 'skip' && !requestedId
+    while (entry) {
+      let checked
+      replaying = true
+      try {
+        checked = preflight(entry.certificate, direction, {
+          isIgnored: isIgnoredNode,
+          ignoreAttribute: isIgnoredAttribute,
+          durableForm: config.durableForm,
+          isProtected: isProtectedNode,
+          inScope,
+          liveNodesWithIds,
+        })
+      } finally {
+        replaying = false
+      }
+      if (!checked.ok) {
+        if (!canSkip) return refuse(entry, direction, checked.code, checked.targets)
+        skipEntry(entry, direction, checked.code, checked.targets, skipped)
+        entry = source.at(-1)
+        continue
+      }
+      pause()
+      let applied
+      replaying = true
+      try {
+        applied = applyOperations(checked.operations)
+      } finally {
+        replaying = false
+        resume()
+      }
+      if (!applied.ok) {
+        log(`${direction} failed and was rolled back`, applied.error)
+        if (!canSkip) return refuse(entry, direction, 'replay-error')
+        skipEntry(entry, direction, 'replay-error', [], skipped)
+        entry = source.at(-1)
+        continue
+      }
+      rebaseContent(new Set(checked.operations.filter((op) => op.type === 'value' && tracked.has(op.target)).map((op) => op.target)))
+      source.pop()
+      destination.push(entry)
+      refusedTop = null
+      const receipt = { ok: true, entryId: entry.id, label: entry.label, direction }
+      if (skipped.length) receipt.skipped = skipped
+      if (applied.caret) receipt.caret = applied.caret
+      log(direction, entry.label)
+      emitter.emit(direction, receipt)
+      return receipt
     }
-    if (!checked.ok) return refuse(entry, direction, checked.code, checked.targets)
-    pause()
-    let applied
-    replaying = true
-    try {
-      applied = applyOperations(checked.operations)
-    } finally {
-      replaying = false
-      resume()
-    }
-    if (!applied.ok) {
-      log(`${direction} failed and was rolled back`, applied.error)
-      return refuse(entry, direction, 'replay-error')
-    }
-    source.pop()
-    destination.push(entry)
+    return { ok: false, code: 'empty', direction, skipped }
+  }
+
+  // Drop a refused entry in the same press. Its description is built while it is
+  // still on its stack (describe() reads refusedTop), so a consumer can keep a
+  // recovery copy of what the removed entry would have restored.
+  function skipEntry(entry, direction, code, targets, skipped) {
+    refusedTop = { entryId: entry.id, direction, code, targets }
+    const description = describe(entry.id)
+    const stack = direction === 'undo' ? undoStack : redoStack
+    stack.pop()
     refusedTop = null
-    const receipt = { ok: true, entryId: entry.id, label: entry.label, direction }
-    log(direction, entry.label)
-    emitter.emit(direction, receipt)
-    return receipt
+    const record = { entryId: entry.id, label: entry.label, direction, code, targets, description }
+    log('skipped', direction, code)
+    emitter.emit('skipped', record)
+    skipped.push(record)
   }
 
   function undo(opts) { return replay('undo', opts && opts.entryId) }
@@ -573,6 +717,15 @@ export function createScope(opts) {
     }
   }
 
+  // A host's durable form is stored as #form:"<json string>"; a description shows the
+  // string itself, not the token.
+  function readableForm(content) {
+    if (typeof content !== 'string') return null
+    return content.replace(/#form:("(?:[^"\\]|\\.)*")/g, (_, json) => {
+      try { return JSON.parse(json) } catch (_) { return '' }
+    })
+  }
+
   function describeStep(step) {
     if (step.type === 'move') {
       return {
@@ -588,7 +741,7 @@ export function createScope(opts) {
       return {
         kind: step.type === 'add' ? 'add' : 'remove',
         parent: { id: described(step.parent).id },
-        nodes: step.nodes.map((node, i) => ({ id: described(node).id, html: step.content[i] ?? null })),
+        nodes: step.nodes.map((node, i) => ({ id: described(node).id, html: readableForm(step.content[i]) })),
       }
     }
     const primitive = step.primitive
@@ -616,7 +769,9 @@ export function createScope(opts) {
       grew = false
       for (const r of records) {
         if (r.type !== 'childList' || !r.removedNodes?.length) continue
+        if (isTrackedContent(r)) continue
         if (!observedHere(r.target) && !insideRemoved(r.target, removed)) continue
+        if (shouldIgnore(r.target, config.ignoreAttribute, r)) continue
         for (const node of r.removedNodes) if (!removed.has(node)) { removed.add(node); grew = true }
       }
     }
@@ -630,7 +785,7 @@ export function createScope(opts) {
 
   function observedHere(node) {
     const root = config.scope
-    if (!root || !node) return false
+    if (!root || !node || typeof node.nodeType !== 'number') return false
     return node === root || (typeof root.contains === 'function' && root.contains(node))
   }
 
@@ -677,7 +832,7 @@ export function createScope(opts) {
     // Discard any same-tick buffered records too, so a bootstrap mutation
     // followed by clear() in the same turn doesn't resurface as a commit once
     // the observer callback fires.
-    if (observer) observer.takeRecords()
+    if (observer) rebaseContent(contentRootsIn(observer.takeRecords()))
     undoStack.length = 0
     redoStack.length = 0
     pendingPrimitives = []
@@ -691,10 +846,12 @@ export function createScope(opts) {
 
   return {
     _config: config,  // private: used by keys.js to read shadowKeydownIn
+    _tracksContentAt: (node) => recordingMode !== 'commands' && !!trackedRootOf(node),  // private: keys.js rule 4
+    _recordsAt: (node) => recordingMode !== 'commands' && !isIgnoredNode(node),  // private: keys.js rule 4
     start, stop,
     commit, commitCaptured, discardCaptured, flush,
     command, setRecording,
-    record, recordValue,
+    record, recordValue, trackContent,
     undo, redo, clear, discard, describe,
     pause, resume,
     on: emitter.on, off: emitter.off,

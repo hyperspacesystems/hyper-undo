@@ -1,5 +1,23 @@
 # hyper-undo changelog
 
+## [Unreleased]
+
+### Added
+- `refused: 'skip'` scope option: one `undo()` or `redo()` press removes each entry that preflight or apply refuses (every code), emits a `skipped` event carrying the entry's plain-data description, and goes on to the next entry until one applies or the stack is empty. The receipt gains a `skipped` list, and the default (`null`) keeps a refused entry on top as before.
+- `skipped` event: fired once per entry a `refused: 'skip'` press removes.
+- `trackContent(root, { read, write, prop })`: a field's content is recorded as one guarded value step, its saved HTML before and after, sampled from the changes inside the root instead of the raw text and node steps those changes would otherwise leave. Returns a release function, and `stop()` forgets every tracked root.
+- `durableForm` scope option: a host gives a node a stable saved form, used instead of its live markup when certifying and replaying steps
+- `editableKeys: 'page'` scope option: in editable content, Cmd+Z, Cmd+Shift+Z, Ctrl+Y and the browser's own `beforeinput` `historyUndo`/`historyRedo` go to the page history instead of the browser's per-field undo. Form controls, IME compositions, the `shadowKeydownIn` editors and regions the scope does not record keep their own undo, and the default leaves every key with the browser.
+- `ownKeysIn` option: selectors whose history keys belong to the page even inside a `shadowKeydownIn` editor.
+- `holdReplay` option: a consumer can hold undo and redo, which then return `{ ok: false, code: 'held' }` without refusing the entry, touching a stack or changing the document.
+- `typingBreak: 'sentence'` scope option: an undo press undoes one sentence of typing. A step closes after the space or line break that follows `.`, `?` or `!`, at a field switch, at a switch between typing and deleting, after a paste, a drop, a cut or a format command, when a selection is replaced, and at a caret jump made with the mouse or the navigation keys. An open IME composition never lets the idle timer close a step, on every scope.
+- `endsSentence(textBefore)`: the sentence rule as a predicate, for a host that groups typing the same way.
+- A successful `undo()` or `redo()` receipt gains `caret`, where the applied entry changed text: `{ node, offset }` for a text node or an added or removed one, and `{ root, textOffset }` for a tracked content root. The key is present only when the applied entry changed text; a refused press carries no `caret`. A press that skips entries and then applies one reports that entry's `caret`. The engine never touches the selection.
+
+### Fixed
+- Changes inside a subtree removed from a `no-undo` region no longer leave a history entry
+- An entry description shows a node's durable form as text, not as an internal token
+
 ## [0.6.4] - 2026-10-15
 
 ### Changed

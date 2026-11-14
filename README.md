@@ -66,12 +66,13 @@ the box.
 | `undo.discardCaptured()` | drain and throw away the captured records (failure path companion) |
 | `undo.flush()` | force-close the current idle batch as its own commit |
 | `undo.command(label, fn)` | run a synchronous `fn` and push only its own writes as one labelled entry; returns `{ id, label }`, or `null` when it wrote nothing |
+| `undo.trackContent(root, { read, write, prop })` | record `root`'s content as one guarded value step: `read(root)` is sampled when a mutation lands inside the root and `write(root, html)` replays a step, so the inside of a tracked root is never recorded as raw text or node steps. Returns a release function; `stop()` forgets every tracked root. `prop` defaults to `'content'` |
 | `undo.setRecording(mode)` | `'automatic'` (default) or `'commands'`; see [Recording modes](#recording-modes) |
-| `undo.undo()` / `undo.redo()` | navigate history; each returns a receipt, `{ ok: true, entryId, label, direction }` or `{ ok: false, code, entryId, label, direction }`. `undo({ entryId })` and `redo({ entryId })` replay only while that entry is the next one, and refuse `stale-entry` otherwise |
+| `undo.undo()` / `undo.redo()` | navigate history; each returns a receipt, `{ ok: true, entryId, label, direction, skipped, caret }` or `{ ok: false, code, entryId, label, direction }`. `skipped` is the list of skip records from this call and is present only when something was skipped, and a press that only skipped returns `{ ok: false, code: 'empty', direction, skipped }`. `caret` says where the applied entry changed text (see [Where the text changed](#where-the-text-changed)); it is present only when the applied entry changed text. `undo({ entryId })` and `redo({ entryId })` replay only while that entry is the next one, refuse `stale-entry` otherwise, and never skip |
 | `undo.discard(entryId)` | drop the refused top entry, and only that one: `{ ok: true, entryId, direction }`, or `{ ok: false, code: 'not-refused' }` |
 | `undo.clear()` | clear both stacks |
 | `undo.pause()` / `undo.resume()` | recorder skips while paused |
-| `undo.on('undo'\|'redo'\|'commit'\|'refused'\|'discard'\|'clear', fn)` / `undo.off(...)` | subscribe to lifecycle events; `undo`/`redo` fire after a navigate with the receipt, `refused` with `{ entryId, label, direction, code, targets }`, `commit` after a new commit, `discard` with `{ entryId, label, direction }`, `clear` after a reset. (No generic `change` event.) |
+| `undo.on('undo'\|'redo'\|'commit'\|'refused'\|'skipped'\|'discard'\|'clear', fn)` / `undo.off(...)` | subscribe to lifecycle events; `undo`/`redo` fire after a navigate with the receipt, `refused` with `{ entryId, label, direction, code, targets }`, `skipped` with `{ entryId, label, direction, code, targets, description }`, `commit` after a new commit, `discard` with `{ entryId, label, direction }`, `clear` after a reset. (No generic `change` event.) |
 | `undo.canUndo` / `undo.canRedo` | booleans (getters) |
 | `undo.history` | `[{ id, label, timestamp }, ...]`, oldest first; `timestamp` is `Date.now()` millis. The entry that was just refused also carries `refused: { direction, code, targets }` |
 | `undo.future` | the redo stack in the same shape, next redo first |
@@ -90,9 +91,15 @@ the box.
 | `idleLabel` | `'Edit'` | label for auto-closed batches |
 | `bindKeys` | `true` (singleton), `false` (`create`) | install the global Cmd+Z handler |
 | `shadowKeydownIn` | code-editor selectors (see below) | when `event.target.closest(selector)` matches, the global handler bails without `preventDefault` |
+| `editableKeys` | `'native'` | how the history keys and the browser's own history input event are routed inside editable content. `'native'` leaves every `contenteditable` (and the `shadowKeydownIn` list) its own undo. `'page'` sends Cmd+Z, Cmd+Shift+Z, Ctrl+Y and a `beforeinput` `historyUndo`/`historyRedo` to the page history when the target sits inside a tracked content root or matches `ownKeysIn`; a form control, the `shadowKeydownIn` list and an editing host the scope does not record keep their own undo. Only then is `beforeinput` listened to at all |
+| `ownKeysIn` | `null` | selectors whose history keys and history input events belong to the page stack under `editableKeys: 'page'`, even when the element also matches `shadowKeydownIn` (a block editor sharing its element with `.ProseMirror`) |
+| `typingBreak` | `null` | `'sentence'` closes the open typing step after the space or line break that follows `.`, `?` or `!` (the delimiter belongs to the finished sentence), at a switch to another field, at a switch between typing and deleting, after a paste, a drop, a cut or a format command, when a selection is replaced, and at a caret jump made with the mouse or a navigation key. So one undo press undoes one sentence of typing. On every scope an open IME composition holds the idle step open |
+| `holdReplay` | `null` | function `() => boolean`; while it answers true, `undo()` and `redo()` return `{ ok: false, code: 'held' }` without flushing, moving either stack, changing the document or emitting `refused` |
+| `refused` | `null` | `'skip'` lets one `undo()` or `redo()` press get past a step it can no longer replay: the refused entry is removed from its stack (it goes to no other stack), announced with a `skipped` event, and the same call goes on to the next entry until one applies or the stack is empty. Every refusal code is skipped, `replay-error` included, but `undo({ entryId })` never skips. The default keeps a refused entry on top. See [Refusals](#refusals) |
 | `ignoreAttribute` | `null` | predicate `(attrName, element) => boolean`; return true to skip recording that attribute mutation, and the certificate's projection skips it too, so such a change never refuses a later undo or redo. |
 | `isProtected` | `null` | predicate `(node) => boolean`; return true for content that no undo or redo may erase, and an operation that would remove or replace a subtree containing such a node is refused with code `"protected"`. |
 | `ignoreNode` | `null` | predicate `(node) => boolean`; in automatic mode a `childList` record whose every added and removed node it accepts is not recorded, so a gesture's own repeated moves leave no generic entry beside the one the consumer records with `command`, and such a node is left out of a bracketed entry's added and removed lists too. |
+| `durableForm` | `null` | function `(node, host) => string \| undefined`; return a string for a node whose live markup is not its saved markup (a mounted rich text editor), and the certificate uses that string as the node's whole form instead of looking inside it, at record time and at every replay check. Return `undefined` to keep the default form. A throw or a non-string also keeps the default. |
 | `debug` | `false` | console.log internal state transitions |
 
 ## Batching
@@ -140,6 +147,39 @@ undo.undo()   // { ok: true, entryId, label, direction }
 | `empty` | nothing to replay on that stack |
 
 A refused entry keeps its place on top, and `undo.history` (or `undo.future`) shows `refused: { direction, code, targets }` on it, so nothing is lost and nothing is silently skipped. `undo.discard(entryId)` drops exactly that entry and leaves the document and every other entry as they are.
+
+### Skipping what can no longer be replayed
+
+By default a refused entry keeps its place on top, so every later press refuses it again until it is dismissed. With `refused: 'skip'` one press removes it instead and goes on:
+
+```js
+const undo = hyperundo.create({ refused: 'skip' })
+undo.on('skipped', ({ entryId, label, direction, code, targets, description }) => keepCopy(description))
+
+undo.undo()
+// { ok: true, entryId: 'A', label: 'Edit A', direction: 'undo',
+//   skipped: [{ entryId: 'C', label: 'Edit C', direction: 'undo', code: 'content-changed',
+//               targets: [...], description: { id: 'C', label: 'Edit C', ... } }] }
+```
+
+The press pops each refused entry, emits one `skipped` event for it and continues to the next entry in the same call, until one applies or the stack is empty (`{ ok: false, code: 'empty', direction, skipped }`). A skipped entry goes to no other stack and emits no `refused` event. Its `description` is the plain-data `describe(entryId)` of the entry, built before it is removed, so a consumer can keep a recovery copy after the fact. `undo({ entryId })` never skips: a named entry is refused as it is today.
+
+### Where the text changed
+
+A successful receipt carries `caret`, taken from the last operation of the replay that changed text, so a host can put the caret where the removed or restored text was. The key is present only when the applied entry changed text:
+
+| The entry changed | `caret` |
+|---|---|
+| a text node | `{ node, offset }`, at the end of the changed run of its data |
+| a tracked content root (`trackContent`) | `{ root, textOffset }`, at the end of the changed run of `root.textContent` |
+| added or removed a text node | `{ node, offset }`: the parent at the node's index, or the node at its length |
+| a value step with a `write` and no `content` flag, an attribute, a node that is not text | no `caret` key |
+
+```js
+undo.undo()   // { ok: true, entryId, label, direction, skipped, caret: { node, offset: 5 } }
+```
+
+The engine never reads or writes the selection; placing the caret is the host's job. A refused or skipped press reports no `caret`, and when one press skips entries and then applies one, the `caret` is the applied entry's.
 
 `targets` is one `{ id, kind }` per node the refused step addresses. `id` is the nearest `[data-id]` ancestor, so a text step with no id of its own names the record it was typed in, and `null` when nothing in the ancestor chain carries one; `kind` says what the target was to the step (`added`, `removed`, `move`, `protected`, or the attribute or property name of a value step). The receipt's own `targets` are on the `refused` event and the history entry, so a consumer can name the record a refusal is about without asking the engine again.
 
@@ -197,6 +237,32 @@ stack never undoes inside it. Typing that is not written into an attribute
 records nothing: the page's Cmd+Z history starts at the write a commit or a
 `command` makes of that text. Pass `bindKeys: false` to opt out entirely and
 bind your own handler.
+
+### One undo press, one sentence of typing
+
+`typingBreak: 'sentence'` groups typing into sentences instead of into half
+second batches. A step closes after the space or line break that follows `.`,
+`?` or `!`, so the space belongs to the finished sentence; the rule is simple on
+purpose, so `e.g. ` ends a step early and `3.5` does not. It also closes at a
+switch to another field, at a switch between typing and deleting, after a paste,
+a drop, a cut or a format command (each is a step of its own), when a selection
+is replaced, and at a caret jump made with the mouse or with the navigation
+keys. An open IME composition never lets the idle timer close a step, with or
+without the option.
+
+`endsSentence(textBefore)` is exported for a host that needs the same rule.
+
+### Editable content can share the page history
+
+`editableKeys: 'page'` gives `contenteditable` fields the page's timeline. A key
+or the browser's own Undo (`beforeinput` `historyUndo`) inside a plain field, a
+tracked rich field, or an element named by `ownKeysIn` calls `undo()` or
+`redo()`; the event is prevented, so the browser's per-field undo never runs and
+the two histories cannot drift. An `input`, a `textarea`, a `select`, an open
+IME composition, the `shadowKeydownIn` list, and an editing host inside a
+region the scope does not record (an authored `no-undo` field) keep their own
+undo. An empty page history still prevents the key: the field's own undo would
+change text the page history does not know about.
 
 ## Filter attributes
 

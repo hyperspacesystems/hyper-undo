@@ -1,5 +1,6 @@
 import { createScope } from './scope.js'
 import { installKeys } from './keys.js'
+import { endsSentence } from './typing.js'
 
 const DEFAULT_SHADOW_LIST = [
   '.CodeMirror',
@@ -21,6 +22,14 @@ const DEFAULT_SHADOW_LIST = [
   // in richclay/src/richclay.js, which says it marks the region so hyper-undo
   // "defers to Squire instead of fighting it".
   '[data-richclay-active]',
+  // Embedded third-party editors keep their own history: the page stack never
+  // records what is typed in them, so a page-mode Cmd+Z there would revert some
+  // other field instead of the editor's own last change.
+  '.ck-editor__editable',
+  '[data-lexical-editor]',
+  '[data-slate-editor]',
+  'trix-editor',
+  '.mce-content-body',
 ]
 
 let singleton = null         // the Scope instance returned by createScope
@@ -113,6 +122,7 @@ const undo = {
       flush: inst.flush,
       record: inst.record,
       recordValue: inst.recordValue,
+      trackContent: inst.trackContent,
       undo: inst.undo,
       redo: inst.redo,
       clear: inst.clear,
@@ -152,6 +162,7 @@ const undo = {
   discardCaptured()       { return singleton ? singleton.discardCaptured() : undefined },
   record(p)               { return singleton ? singleton.record(p) : undefined },
   recordValue(t, o)       { return singleton ? singleton.recordValue(t, o) : undefined },
+  trackContent(root, o)   { return singleton ? singleton.trackContent(root, o) : () => {} },
   undo(opts)              { return singleton ? singleton.undo(opts) : undefined },
   redo(opts)              { return singleton ? singleton.redo(opts) : undefined },
   clear()                 { return singleton ? singleton.clear() : undefined },
@@ -169,5 +180,5 @@ const undo = {
   get isPaused()          { return singleton ? singleton.isPaused : false },
 }
 
-export { undo }
+export { undo, endsSentence }
 export default undo

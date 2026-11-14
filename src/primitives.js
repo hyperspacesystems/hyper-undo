@@ -124,7 +124,7 @@ export function recordsToPrimitives(records, ignoreNode = null) {
 // more than once. Keep ONE primitive per (target, field) carrying the first old
 // value and the final new value, and drop the ones whose endpoints are equal:
 // undo must walk back to the value before the entry, not to an intermediate one.
-export function normalizePrimitives(primitives) {
+export function normalizePrimitives(primitives, { sameContent = (a, b) => a === b } = {}) {
   const out = []
   const slots = new Map()   // target → Map(field → index in out)
 
@@ -148,6 +148,7 @@ export function normalizePrimitives(primitives) {
   for (const p of out) {
     if (scalarField(p) == null) { normalized.push(p); continue }
     if (p.oldValue === p.newValue) continue
+    if (p.kind === 'value' && p.content === true && sameContent(p.oldValue, p.newValue)) continue
     normalized.push(reclassifyScalar(p))
   }
   return normalized
