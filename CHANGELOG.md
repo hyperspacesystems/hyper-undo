@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-14
+
 ### Added
 - `refused: 'skip'` scope option: one `undo()` or `redo()` press removes each entry that preflight or apply refuses (every code), emits a `skipped` event carrying the entry's plain-data description, and goes on to the next entry until one applies or the stack is empty. The receipt gains a `skipped` list, and the default (`null`) keeps a refused entry on top as before.
 - `skipped` event: fired once per entry a `refused: 'skip'` press removes.
